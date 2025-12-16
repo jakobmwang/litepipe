@@ -1,0 +1,13 @@
+[project]
+name = "litepipe"
+version = "0.1.0"
+description = "Standardized document ingestion preparation with minimal configuration."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "docling",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
