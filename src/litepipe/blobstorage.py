@@ -9,12 +9,6 @@ import os
 from botocore.exceptions import ClientError
 from typing import BinaryIO, Any
 
-
-S3_ENDPOINT = os.getenv("S3_ENDPOINT_URL", "http://localhost:9000")
-S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "litepipe")
-S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "__CHANGE_ME__")
-S3_REGION = os.getenv("S3_REGION", "eu-north-1")
-
 BUCKETS = ["document-cache", "markdown-cache", "chunk-cache"]
 
 logger = logging.getLogger()
@@ -35,10 +29,10 @@ class BlobStorage:
         """
         return self.session.client(
             "s3",
-            endpoint_url=S3_ENDPOINT,
-            aws_access_key_id=S3_ACCESS_KEY,
-            aws_secret_access_key=S3_SECRET_KEY,
-            region_name=S3_REGION
+            endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
+            aws_access_key_id=os.getenv("S3_ACCESS_KEY", "litepipe"),
+            aws_secret_access_key=os.getenv("S3_SECRET_KEY", "__CHANGE_ME__"),
+            region_name=os.getenv("S3_REGION", "eu-north-1")
         )
 
 
@@ -72,8 +66,7 @@ class BlobStorage:
         bucket: str,
         file_bytes: bytes | BinaryIO,
         file_name: str = "Untitled",
-        content_type: str = "application/octet-stream",
-        key: str | None = None,
+        content_type: str = "application/octet-stream"
     ) -> str:
         """
         Store file bytes and return CAS key.
@@ -81,9 +74,7 @@ class BlobStorage:
         """
         file_bytes = file_bytes.read() if isinstance(file_bytes, BinaryIO) else file_bytes
         key = await self.key(file_bytes)
-        metadata = {}
-        if file_name:
-            metadata['file_name'] = file_name
+        metadata = {'file_name': file_name}
         async with self._client() as s3:
             await s3.put_object(
                 Bucket=bucket,

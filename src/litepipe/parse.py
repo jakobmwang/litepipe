@@ -3,6 +3,7 @@
 Archive/audio/document/nested/tabular parsing and markdown extraction.
 """
 from .blobstorage import BlobStorage
+import asyncio
 import base64
 import clevercsv
 import filetype
@@ -10,9 +11,9 @@ import gzip
 import httpx
 import io
 import logging
+import math
 import os
 import polars as pl
-import subprocess
 import tarfile
 import zipfile
 from typing import BinaryIO
@@ -20,6 +21,7 @@ from typing import BinaryIO
 
 logger = logging.getLogger()
 storage = BlobStorage()
+parsing_semaphore = asyncio.Semaphore(5) # (NOT IMPLEMENTED)
 
 
 async def parse_from_key(file_key: str, use_cache: bool = True) -> list[dict] | None:
@@ -37,8 +39,9 @@ async def parse_from_key(file_key: str, use_cache: bool = True) -> list[dict] | 
     if file_dict is None:
         logger.error(f"File not found in storage for key {file_key}")
         return None
-    parsed = await parse_to_markdown(file_dict['file_bytes'], file_dict['file_name'])
-    await parse_to_cache(file_key, parsed)
+    parsed = await parse_to_markdown(file_dict['file_bytes'], file_dict['file_name'], use_cache)
+    parsed_keys = await parse_to_cache(parsed)
+    parsed = [{**d, "file_key": k} for d, k in zip(parsed, parsed_keys)]
     return parsed
 
 
@@ -50,13 +53,14 @@ async def parse_from_bytes(file_bytes: bytes | BinaryIO, file_name: str, use_cac
         [{'file_name': 'document.pdf', 'content_type': 'application/pdf', 'markdown': '...'}]
     """
     file_bytes = file_bytes.read() if isinstance(file_bytes, BinaryIO) else file_bytes
+    file_key = await storage.key(file_bytes)
     if use_cache:
-        file_key = await storage.key(file_bytes)
         cache = await parse_from_cache(file_key)
         if cache:
             return cache
-    parsed = await parse_to_markdown(file_bytes, file_name)
-    await parse_to_cache(file_key, parsed)
+    parsed = await parse_to_markdown(file_bytes, file_name, use_cache)
+    parsed_keys = await parse_to_cache(parsed)
+    parsed = [{**d, "file_key": k} for d, k in zip(parsed, parsed_keys)]
     return parsed
     
 
@@ -74,21 +78,22 @@ async def parse_from_cache(file_key: str) -> list[dict] | None:
     return None
 
 
-async def parse_to_cache(file_key: str, parsed: list[dict]):
+async def parse_to_cache(parsed: list[dict]) -> list:
     """
-    Caches parsed markdown associated to given file key.
+    Caches parsed markdown.
     """
-    for p in parsed:
+    file_keys = [
         await storage.put(
             'markdown-cache',
             p['markdown'].encode('utf-8'),
             p['file_name'],
-            p['content_type'],
-            file_key
-        )
+            p['content_type']
+        ) for p in parsed
+    ]
+    return file_keys
 
 
-async def parse_to_markdown(file_bytes: bytes, file_name: str) -> list[dict]:
+async def parse_to_markdown(file_bytes: bytes, file_name: str, use_cache: bool = True) -> list[dict]:
     """
     Parses most common files and returns markdown.
     Supports archives, audio/video, tabular and documents.
@@ -103,18 +108,17 @@ async def parse_to_markdown(file_bytes: bytes, file_name: str) -> list[dict]:
             return [
                 parsed_item
                 for item in await unarchive(file_bytes, file_name)
-                for parsed_item in await parse_from_bytes(item['file_bytes'], item['file_name'])
+                for parsed_item in await parse_from_bytes(item['file_bytes'], item['file_name'], use_cache)
             ]
         
         # Test for audio (or video), normalize and perform ASR -> markdown
         if file_type.mime.startswith('audio/') or file_type.mime.startswith('video/'):
-            #audio_bytes = await normalize_audio(file_bytes, file_name)
-            #markdown = audio_to_markdown(audio_bytes, file_name)
-            #return [{'file_name': file_name, 'content_type': file_type.mime, 'markdown': markdown}]
-            pass
+            #audio_bytes = await normalize_audio(file_bytes, file_name)  # DONT DO normalize_audio, already included in whisper container
+            markdown = await audio_to_markdown(file_bytes, file_name, file_type.mime)
+            return [{'file_name': file_name, 'content_type': file_type.mime, 'markdown': markdown}]
         
         # Test for image, normalize and perform OCR -> markdown
-        if file_type.mime.startswith('image/') and file_type.extension not in ('jpg', 'png', 'webp', 'tif', 'bmp'):
+        if file_type.mime.startswith('image/') and file_type.extension not in ('jpg', 'png'):
             image_bytes = await normalize_image(file_bytes, file_name)
             markdown = await document_to_markdown(image_bytes, file_name)
             return [{'file_name': file_name, 'content_type': file_type.mime, 'markdown': markdown}]
@@ -312,7 +316,116 @@ async def document_to_markdown(file_bytes: bytes, file_name: str) -> str:
     except Exception as e:
         logger.warning(f"Failed converting document to markdown {file_name}: {e}")
         return ""
+
+
+async def audio_to_markdown(file_bytes: bytes, file_name: str, file_type: str) -> str:
+    """
+    Transcribes audio/video using Whisper and returns markdown table.
+    """
+    try:
+        endpoint = os.environ.get("WHISPER_URL", "http://whisper:8000").rstrip("/")
+        
+        async with httpx.AsyncClient(timeout=None) as client:
+            response = await client.post(
+                f"{endpoint}/v1/audio/transcriptions",
+                files={'file': (file_name, file_bytes, file_type)},
+                data={
+                    'response_format': 'verbose_json',
+                    #'vad_filter': 'true', # causes hallucinations :(
+                    #'language': 'da', # too restrictive, auto-detect is better
+                },
+            )
+            response.raise_for_status()
+            result = response.json()
+        
+        segments = result.get('segments', [])
+        if not segments:
+            logger.warning(f"No segments returned from Whisper for {file_name}")
+            return ""
+        
+        # Merge segments adaptively to minute boundaries
+        merged = merge_to_adaptive_minutes(segments, min_duration=30.0)
+        
+        # Build markdown table
+        rows = [
+            f"| {format_timestamp(seg['start'])} - {format_timestamp(seg['end'])} | {seg['text'].strip()} |"
+            for seg in merged
+        ]
+        
+        header = "| Tidsstempel | Tekstsegment |\n|-------------|--------------|"
+        return header + "\n" + "\n".join(rows)
+        
+    except httpx.HTTPError as e:
+        logger.warning(f"HTTP error transcribing {file_name}: {e}")
+        return ""
+    except Exception as e:
+        logger.warning(f"Failed transcribing audio {file_name}: {e}")
+        return ""
+
+
+def merge_to_adaptive_minutes(segments: list[dict], min_duration: float = 30.0) -> list[dict]:
+    """
+    Merges Whisper segments adaptively:
+    - Always merge until exceeding next whole minute from buffer start
+    - After flush, next buffer must be min_duration AND exceed the next whole minute after that
+    """
     
+    merged = []
+    buffer_segments = []
+    buffer_start = 0.0
+    
+    for seg in segments:
+        buffer_segments.append(seg)
+        buffer_end = seg['end']
+        buffer_duration = buffer_end - buffer_start
+        
+        # Next whole minute from buffer start
+        next_minute_from_start = math.ceil(buffer_start / 60.0) * 60.0
+        
+        # Have we exceeded that minute?
+        if buffer_end > next_minute_from_start:
+            # Do we also have minimum duration?
+            if buffer_duration >= min_duration:
+                # What's the next whole minute after (start + min_duration)?
+                min_end = buffer_start + min_duration
+                next_minute_after_min = math.ceil(min_end / 60.0) * 60.0
+                
+                # Have we exceeded that minute too?
+                if buffer_end >= next_minute_after_min:
+                    # Flush buffer
+                    merged_seg = {
+                        'start': buffer_start,
+                        'end': buffer_end,
+                        'text': ' '.join(s['text'].strip() for s in buffer_segments)
+                    }
+                    merged.append(merged_seg)
+                    
+                    # Reset for next buffer
+                    buffer_start = buffer_end
+                    buffer_segments = []
+    
+    # Flush remaining
+    if buffer_segments:
+        buffer_end = buffer_segments[-1]['end']
+        merged_seg = {
+            'start': buffer_start,
+            'end': buffer_end,
+            'text': ' '.join(s['text'].strip() for s in buffer_segments)
+        }
+        merged.append(merged_seg)
+    
+    return merged
+
+
+def format_timestamp(seconds: float) -> str:
+    """
+    Formats seconds to HH:MM:SS timestamp.
+    """
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+ 
 
 async def normalize_text(file_bytes: bytes) -> bytes:
     """
@@ -349,18 +462,22 @@ async def normalize_audio(file_bytes: bytes, file_name: str) -> bytes:
         'pipe:1'                            # Write to stdout
     ]
     try:
-        process = subprocess.run(
-            cmd,
-            input=file_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=True
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        return process.stdout
+        stdout, stderr = await process.communicate(input=file_bytes)
+        if process.returncode != 0:
+            error_msg = stderr.decode('utf-8', errors='ignore')
+            logger.warning(f"ffmpeg failed for {file_name} (code {process.returncode}): {error_msg}")
+            return b""
+        return stdout
     except Exception as e:
         logger.warning(f"Failed normalizing audio {file_name}: {e}")
         return b""
-
+    
 
 async def normalize_image(file_bytes: bytes, file_name: str) -> bytes:
     """
@@ -378,14 +495,18 @@ async def normalize_image(file_bytes: bytes, file_name: str) -> bytes:
         'pipe:1'                            # Write to stdout
     ]
     try:
-        process = subprocess.run(
-            cmd,
-            input=file_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=True,
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        return process.stdout
+        stdout, stderr = await process.communicate(input=file_bytes)
+        if process.returncode != 0:
+            error_msg = stderr.decode('utf-8', errors='ignore')
+            logger.warning(f"ffmpeg failed for {file_name} (code {process.returncode}): {error_msg}")
+            return b""
+        return stdout
     except Exception as e:
         logger.warning(f"Failed normalizing image {file_name}: {e}")
         return b""

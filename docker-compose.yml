@@ -1,5 +1,5 @@
 services:
-  # --- VECTOR DB (Qdrant) ---
+  # --- Qdrant ---
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant
@@ -20,7 +20,7 @@ services:
     restart: unless-stopped
   
 
-  # --- EMBEDDING INFERENCE (Infinity) ---
+  # --- Infinity ---
   infinity:
     image: michaelf34/infinity:latest
     container_name: infinity
@@ -58,7 +58,7 @@ services:
     restart: unless-stopped
 
 
-# --- LEDGER (PostgreSQL) ---
+# --- PostgreSQL ---
   postgres:
     image: postgres:16-alpine
     container_name: postgres
@@ -83,7 +83,7 @@ services:
     restart: unless-stopped
 
 
-  # --- BLOB STORAGE (MinIO / S3) ---
+  # --- MinIO / S3 ---
   minio:
     image: minio/minio:latest
     container_name: minio
@@ -105,7 +105,7 @@ services:
     restart: unless-stopped
 
 
-  # --- DOCUMENT CONVERSION (Docling Serve) ---
+  # --- Docling Serve ---
   docling:
     build: ./docling
     container_name: docling
@@ -137,9 +137,37 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
-    
 
-  # --- PIPELINE (Litepipe) ---
+
+# --- Faster Whisper Server ---
+  whisper:
+    image: fedirz/faster-whisper-server:latest-cuda
+    container_name: whisper
+    runtime: nvidia
+    environment:
+      - WHISPER__MODEL=large-v3  # CHANGE TO large-v3 WHEN L40S
+      - WHISPER__COMPUTE_TYPE=int8  # CHANGE TO float16 WHEN L40S IF POOR PERFORMANCE
+      - WHISPER__INFERENCE_DEVICE=cuda
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+
+  # --- Litepipe ---
   litepipe:
     build: 
       context: .
@@ -164,6 +192,7 @@ services:
       - S3_REGION=${S3_REGION:-eu-north-1}
       - DOCLING_URL=http://docling:5001
       - DOCLING_API_KEY=${DOCLING_API_KEY:-__CHANGE_ME__}
+      - WHISPER_URL=http://whisper:8000
     volumes:
       - hf_cache:/root/.cache/huggingface
       - ./src:/app/src

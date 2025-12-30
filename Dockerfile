@@ -1,4 +1,4 @@
-# Pytorch ready image
+# Slim image
 FROM python:3.12-slim
 
 # Set environment variables

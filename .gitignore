@@ -1,2 +1,4 @@
 .venv/
 .env
+local_tests
+__pycache__/
